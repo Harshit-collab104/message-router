@@ -1,0 +1,27 @@
+# Virtual environment
+msg_router/.venv/
+.venv/
+venv/
+ENV/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Databases & Vector Stores (ChromaDB & SQLite)
+msg_router/chroma_db/
+chroma_db/
+*.db
+*.sqlite
+msg_router_gateway.db
+
+# Secrets & Environment variables
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Message Routing Middleware Gateway - Developer Console</title>
+    <link rel="stylesheet" href="style.css?v=20">
+</head>
+<body>
+    <div class="app-container">
+        <!-- HEADER -->
+        <header class="app-header">
+            <div class="header-logo">
+                <span class="pulse-dot"></span>
+                <h1>RAG Router Gateway</h1>
+                <span class="badge dev-mode">DEV</span>
+            </div>
+            <div class="header-stats">
+                <div class="stat-card">
+                    <span class="stat-label">Latency</span>
+                    <span id="avg-latency" class="stat-value">0.0 ms</span>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-label">Blocked</span>
+                    <span id="blocked-rate" class="stat-value">0%</span>
+                </div>
+                <div class="stat-card">
+                    <span class="stat-value text-success">● Online</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- MAIN LAYOUT -->
+        <main class="console-layout">
+            <!-- COLUMN 1: DEVELOPER SANDBOX -->
+            <section class="console-panel sandbox-panel">
+                <div class="panel-header">
+                    <h2>Developer Sandbox</h2>
+                    <p class="panel-subtitle">Simulate incoming webhook payloads</p>
+                </div>
+                <div class="panel-body">
+                    <!-- Config Settings -->
+                    <div class="sandbox-section">
+                        <h3>Gateway Configuration</h3>
+                        <div class="form-group">
+                            <label for="config-model">Active Routing Engine</label>
+                            <select id="config-model">
+                                <option value="heuristic">Rule-Based Heuristic</option>
+                                <option value="gemini">Gemini LLM Pipeline</option>
+                                <option value="groq">Groq API Fallback (Llama 3.3)</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="config-threshold">
+                                RAG Similarity Threshold: 
+                                <span id="threshold-val">1.5</span>
+                            </label>
+                            <input type="range" id="config-threshold" min="0.1" max="2.0" step="0.1" value="1.5">
+                            <span class="range-helper">Lower distance = stricter matching</span>
+                        </div>
+                        <div class="form-group row-checkbox">
+                            <input type="checkbox" id="config-dnd" checked>
+                            <label for="config-dnd">Enforce Recipient DND hours</label>
+                        </div>
+                        <button id="save-config-btn" class="btn btn-secondary">Apply Rules</button>
+                    </div>
+
+                    <hr class="panel-divider">
+
+                    <!-- Webhook Simulator -->
+                    <div class="sandbox-section">
+                        <h3>Webhook Sandbox Payload</h3>
+                        <div class="form-group">
+                            <label for="payload-recipient">Target Recipient (User)</label>
+                            <select id="payload-recipient">
+                                <!-- Populated dynamically -->
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="incoming-queue">Incoming Queue (dataset/messages.csv)</label>
+                            <select id="incoming-queue">
+                                <option value="">-- Choose message to load --</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="payload-conversation">Conversation Type</label>
+                            <select id="payload-conversation">
+                                <option value="personal">Personal (Direct Chat)</option>
+                                <option value="group">Group Chat</option>
+                                <option value="business">Business Channel</option>
+                            </select>
+                        </div>
+                        <div class="form-group" id="group-select-container" style="display:none;">
+                            <label for="payload-group">Target Group</label>
+                            <select id="payload-group"></select>
+                        </div>
+                        <div class="form-group" id="business-select-container" style="display:none;">
+                            <label for="payload-business">Target Business ID</label>
+                            <select id="payload-business"></select>
+                        </div>
+                        <div class="form-group" id="sender-select-container">
+                            <label for="payload-sender">Sender User ID</label>
+                            <select id="payload-sender"></select>
+                        </div>
+                        <div class="form-group">
+                            <label for="payload-text">Message Content</label>
+                            <textarea id="payload-text" placeholder="Type message or select a template below..." rows="3"></textarea>
+                        </div>
+
+                        <!-- Template Suggestions -->
+                        <div class="template-suggestions">
+                            <span class="suggestion-label">Mock Templates:</span>
+                            <div class="template-badges">
+                                <span class="badge badge-suggest" data-text="Urgent: Your bank account is blocked. Verify now at http://verify-bank.com">Scam OTP</span>
+                                <span class="badge badge-suggest" data-text="Water valve leak in basement! Plumber is coming ASAP.">Urgent Alert</span>
+                                <span class="badge badge-suggest" data-text="Circular: School field trip scheduled for next Friday. Sign consent form.">School Circular</span>
+                                <span class="badge badge-suggest" data-text="Big Sale! Get 50% off on all items today at http://sale.co">Promotion</span>
+                                <span class="badge badge-suggest" data-text="Are we meeting today for lunch?">Personal Chat</span>
+                            </div>
+                        </div>
+
+                        <button id="send-webhook-btn" class="btn btn-primary">POST Webhook Payload</button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- COLUMN 2: LIVE WEBHOOK INTERCEPTOR LOGS -->
+            <section class="console-panel interceptor-panel">
+                <div class="panel-header" style="display: flex; justify-content: space-between; align-items: center;">
+                    <div>
+                        <h2>Gateway Interceptor Logs</h2>
+                        <p class="panel-subtitle">Traces of processed webhook requests</p>
+                    </div>
+                    <button id="refresh-logs-btn" class="btn btn-secondary" style="padding: 0.4rem 0.8rem; font-size: 0.75rem;">Refresh</button>
+                </div>
+                <div class="panel-body">
+                    <div class="logs-container" id="logs-feed">
+                        <!-- Populated dynamically -->
+                        <div class="empty-state">
+                            <p>No traffic intercepted yet. POST a payload using the sandbox to start logging.</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- COLUMN 3: MOCK RECIPIENT DEVICE -->
+            <section class="console-panel device-panel">
+                <div class="panel-header">
+                    <h2>Recipient Device Sandbox</h2>
+                    <p class="panel-subtitle">Simulates the recipient's messaging application</p>
+                </div>
+                <div class="panel-body device-container">
+                    <div class="phone-mockup">
+                        <div class="phone-speaker"></div>
+                        <div class="phone-screen">
+                            <!-- Screen Header -->
+                            <div class="screen-header">
+                                <span class="screen-time" id="device-header-time">12:00</span>
+                                <div class="recipient-profile-info">
+                                    <h4 id="recipient-device-name">Select Recipient</h4>
+                                    <span id="recipient-device-dnd" class="dnd-badge">DND: None</span>
+                                </div>
+                            </div>
+
+                            <!-- Screen Tabs -->
+                            <div class="screen-tabs">
+                                <button class="tab-btn active" data-tab="inbox">
+                                    Notify
+                                    <span id="badge-inbox" class="tab-badge">0</span>
+                                </button>
+                                <button class="tab-btn" data-tab="digest">
+                                    Digest
+                                    <span id="badge-digest" class="tab-badge">0</span>
+                                </button>
+                                <button class="tab-btn" data-tab="quarantine">
+                                    Quarantine
+                                    <span id="badge-quarantine" class="tab-badge">0</span>
+                                </button>
+                            </div>
+
+                            <!-- Screen Body -->
+                            <div class="screen-body">
+                                <div id="device-messages" class="device-message-list">
+                                    <!-- Populated dynamically -->
+                                    <p class="device-empty-state">No messages delivered.</p>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="phone-home-button"></div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- RAG DETAILS INSPECTOR DRAWER -->
+    <div id="inspector-modal" class="modal-overlay">
+        <div class="modal-card">
+            <div class="modal-header">
+                <h3>RAG Webhook Trace Auditor</h3>
+                <button class="close-btn" id="close-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="inspector-grid">
+                    <div class="inspector-summary">
+                        <div class="summary-item">
+                            <span class="label">Decision Action:</span>
+                            <span id="inspect-action" class="val badge">notify</span>
+                        </div>
+                        <div class="summary-item">
+                            <span class="label">Message Category:</span>
+                            <span id="inspect-type" class="val text-highlight">urgent</span>
+                        </div>
+                        <div class="summary-item">
+                            <span class="label">Confidence Score:</span>
+                            <span id="inspect-confidence" class="val text-highlight">0.95</span>
+                        </div>
+                        <div class="summary-item">
+                            <span class="label">Trace Latency:</span>
+                            <span id="inspect-latency" class="val text-highlight">12.5 ms</span>
+                        </div>
+                    </div>
+
+                    <div class="inspector-details">
+                        <h4>Incoming Message Data</h4>
+                        <div class="data-block pre-block" id="inspect-message-data"></div>
+
+                        <h4>Compiled RAG context prompt</h4>
+                        <div class="data-block pre-block font-mono" id="inspect-prompt"></div>
+
+                        <h4>ChromaDB Vector Retrieval Match details</h4>
+                        <div class="rag-results-container" id="inspect-rag-matches">
+                            <!-- Populated dynamically -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script src="app.js?v=20"></script>
+</body>
+</html>

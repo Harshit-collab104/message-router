@@ -1,0 +1,12 @@
+pandas
+numpy
+pillow
+google-genai
+python-dotenv
+chromadb
+tqdm
+requests
+fastapi
+uvicorn
+sqlalchemy
+datasets
