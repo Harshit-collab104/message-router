@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Copy requirements file first to leverage docker cache
-COPY msg_router/requirements.txt .
+COPY requirements.txt .
 
 # Install python dependencies
 RUN pip install --no-cache-dir -r requirements.txt pytest httpx
@@ -25,4 +25,4 @@ EXPOSE 8000
 ENV PYTHONUNBUFFERED=1
 
 # Command to run uvicorn server
-CMD ["python", "-m", "uvicorn", "msg_router.server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
