@@ -1,24 +1,27 @@
 import datetime
+import base64
+import hashlib
+import hmac
 import json
+import math
 import os
 import sys
 import time
 from pathlib import Path
+from urllib.parse import parse_qs
 
 import numpy as np
 import pandas as pd
+import httpx
 import sqlalchemy
-from dotenv import load_dotenv
-from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi import Body, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import Column, DateTime, Float, Integer, String, Text, create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-
-# Load .env file
-load_dotenv()
+from sqlalchemy.exc import IntegrityError
 
 # Setup path to import from main.py and vector_store.py
 PARENT_DIR = Path(__file__).parent
@@ -30,6 +33,7 @@ from main import (
     business_accounts,
     compile_prompt,
     get_message_history,
+    get_message_events,
     get_messages,
     group_members,
     groups,
@@ -40,24 +44,45 @@ from main import (
     user_business_history,
     users,
     voice_notes,
+    routing_flags,
+    apply_routing_policy,
+    validate_routing_result,
+    groq_completion,
+    get_routing_local_history,
 )
+from dataset_store import GATEWAY_DB_PATH, DATA_DIR, OFFLINE, DatasetError, inspect_dataset
 from vector_store import get_client as get_chroma_client
 from vector_store import retrieve_relevant_history
 
-# Initialize FastAPI App
-app = FastAPI(title="Message Routing Middleware Gateway")
+async def require_gateway_token(request: Request):
+    """The developer console/admin API has one explicit owner credential."""
+    if not request.url.path.startswith('/api/') or request.url.path in {
+        '/api/webhook/whatsapp', '/api/webhook/twilio-whatsapp'}:
+        return  # Provider endpoints authenticate their own signed requests.
+    expected = os.environ.get('GATEWAY_API_TOKEN')
+    if not expected:
+        raise HTTPException(status_code=503, detail='GATEWAY_API_TOKEN is not configured')
+    supplied = request.headers.get('authorization', '')
+    scheme, _, token = supplied.partition(' ')
+    if scheme.lower() != 'bearer' or not hmac.compare_digest(token.encode(), expected.encode()):
+        raise HTTPException(status_code=401, detail='Invalid gateway credential',
+                            headers={'WWW-Authenticate': 'Bearer'})
+
+
+app = FastAPI(title="Message Routing Middleware Gateway", dependencies=[Depends(require_gateway_token)])
 
 # Allow CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[origin.strip() for origin in os.environ.get('GATEWAY_CORS_ORIGINS', '').split(',') if origin.strip()],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 # SQLite Database Setup (Self-contained in msg_router directory)
-DB_PATH = Path(__file__).parent / "msg_router_gateway.db"
+DB_PATH = GATEWAY_DB_PATH
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 DATABASE_URL = f"sqlite:///{DB_PATH}"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -85,15 +110,35 @@ class GatewayLog(Base):
     timestamp = Column(DateTime, default=datetime.datetime.utcnow)
     retrieved_rag = Column(Text)  # JSON-stringified vector matches
     prompt_compiled = Column(Text)
+    digest_delivered = Column(Integer, default=0, index=True)
+
+
+class GatewayReceipt(Base):
+    """Additive receipt/claim table; no rewriting historical gateway logs."""
+    __tablename__ = 'gateway_receipts'
+    id = Column(String, primary_key=True)
+    response = Column(Text, nullable=True)
 
 
 Base.metadata.create_all(bind=engine)
 
+# Safe migration check for existing SQLite databases
+with engine.connect() as conn:
+    try:
+        if 'digest_delivered' not in {column['name'] for column in sqlalchemy.inspect(engine).get_columns('gateway_logs')}:
+            conn.execute(sqlalchemy.text('ALTER TABLE gateway_logs ADD COLUMN digest_delivered INTEGER DEFAULT 0'))
+        conn.execute(sqlalchemy.text('CREATE INDEX IF NOT EXISTS ix_gateway_logs_digest_delivered ON gateway_logs (digest_delivered)'))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
 # Active Gateway Configuration State
-gemini_key = os.environ.get("GEMINI_API_KEY")
-groq_key = os.environ.get("GROQ_API_KEY")
+gemini_key = None if OFFLINE else os.environ.get("GEMINI_API_KEY")
+groq_key = None if OFFLINE else os.environ.get("GROQ_API_KEY")
 
 CONFIG = {
+    "offline_mode": OFFLINE,
     "active_model": "gemini" if gemini_key else ("groq" if groq_key else "heuristic"),
     "l2_distance_threshold": 1.5,
     "dnd_enabled": True,
@@ -122,29 +167,86 @@ async def get_gateway_config():
 
 @app.post("/api/gateway/config")
 async def update_gateway_config(new_config: dict = Body(...)):
-    global CONFIG
-    if "active_model" in new_config:
-        model = new_config["active_model"]
-        if model == "gemini" and not gemini_client:
-            raise HTTPException(
-                status_code=400,
-                detail="Gemini API Client is not configured. Add GEMINI_API_KEY to environment.",
-            )
-        if model == "groq" and not groq_key:
-            raise HTTPException(
-                status_code=400,
-                detail="Groq API key is not configured. Add GROQ_API_KEY to environment.",
-            )
-        CONFIG["active_model"] = model
-    if "l2_distance_threshold" in new_config:
-        CONFIG["l2_distance_threshold"] = float(new_config["l2_distance_threshold"])
-    if "dnd_enabled" in new_config:
-        CONFIG["dnd_enabled"] = bool(new_config["dnd_enabled"])
+    candidate = dict(CONFIG)
+    if 'active_model' in new_config:
+        model = new_config['active_model']
+        if OFFLINE and model != 'heuristic':
+            raise HTTPException(400, 'LLM engines are disabled in offline mode')
+        if model not in {'heuristic', 'gemini', 'groq'}:
+            raise HTTPException(400, 'Unknown active_model')
+        if model == 'gemini' and not gemini_client:
+            raise HTTPException(400, 'GEMINI_API_KEY is not configured')
+        if model == 'groq' and not groq_key:
+            raise HTTPException(400, 'GROQ_API_KEY is not configured')
+        candidate['active_model'] = model
+    if 'l2_distance_threshold' in new_config:
+        value = new_config['l2_distance_threshold']
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 2:
+            raise HTTPException(400, 'l2_distance_threshold must be a finite number between 0 and 2')
+        candidate['l2_distance_threshold'] = float(value)
+    if 'dnd_enabled' in new_config:
+        if not isinstance(new_config['dnd_enabled'], bool):
+            raise HTTPException(400, 'dnd_enabled must be a boolean')
+        candidate['dnd_enabled'] = new_config['dnd_enabled']
+    CONFIG.update(candidate)
     return CONFIG
 
 
-@app.post("/api/gateway/webhook")
-async def receive_webhook_message(payload: dict = Body(...)):
+def claim_receipt(key):
+    try:
+        with SessionLocal.begin() as db:
+            db.add(GatewayReceipt(id=key))
+            db.flush()
+    except IntegrityError:
+        with SessionLocal() as db:
+            receipt = db.get(GatewayReceipt, key)
+            if receipt is not None and receipt.response is not None:
+                response = json.loads(receipt.response)
+                response['duplicate'] = True
+                return response
+        raise HTTPException(409, 'An operation with this identifier is already in progress')
+    return None
+
+
+def release_receipt(key):
+    with SessionLocal.begin() as db:
+        db.query(GatewayReceipt).filter_by(id=key).delete()
+
+
+def validate_message(payload):
+    for field in ('message_id', 'user_id', 'conversation_type'):
+        if not isinstance(payload.get(field), str) or not payload[field].strip():
+            raise HTTPException(400, f'Missing or invalid {field}')
+    if payload['conversation_type'] not in {'personal', 'group', 'business'}:
+        raise HTTPException(400, 'Unknown conversation_type')
+    if not isinstance(payload.get('message_text', ''), str):
+        raise HTTPException(400, 'message_text must be a string')
+    count = payload.get('forwarded_count', 0)
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise HTTPException(400, 'forwarded_count must be a non-negative integer')
+    for field in ('sender_user_id', 'group_id', 'business_id', 'media_type', 'media_id'):
+        if payload.get(field) is not None and not isinstance(payload[field], str):
+            raise HTTPException(400, f'{field} must be a string or null')
+
+
+async def route_incoming_message(payload: dict, *, source: str = 'internal') -> dict:
+    validate_message(payload)
+    key = json.dumps(['message', source, payload['user_id'], payload['message_id']], separators=(',', ':'))
+    cached = claim_receipt(key)
+    if cached is not None:
+        return cached
+    try:
+        return await _route_new_message(payload, receipt_key=key, source=source)
+    except Exception:
+        with SessionLocal() as db:
+            receipt = db.get(GatewayReceipt, key)
+            completed = receipt is not None and receipt.response is not None
+        if not completed:
+            release_receipt(key)
+        raise
+
+
+async def _route_new_message(payload: dict, *, receipt_key=None, source='internal') -> dict:
     start_time = time.time()
 
     message_id = payload.get("message_id")
@@ -183,7 +285,7 @@ async def receive_webhook_message(payload: dict = Body(...)):
 
     # 1. RAG Vector Store Search
     retrieved = []
-    if message_text and message_text.strip() != "":
+    if not OFFLINE and message_text and message_text.strip() != "":
         try:
             retrieved = retrieve_relevant_history(
                 user_id=user_id,
@@ -203,6 +305,11 @@ async def receive_webhook_message(payload: dict = Body(...)):
         if r["distance"] <= CONFIG["l2_distance_threshold"]:
             filtered_retrieved.append(r)
 
+    row_dict['_excluded_history_ids'] = {str(item['message_id']) for item in retrieved if item['distance'] > CONFIG['l2_distance_threshold']}
+    row_dict['_retrieved_history'] = filtered_retrieved
+    row_dict['_dnd_enabled'] = CONFIG['dnd_enabled']
+    row_series = pd.Series(row_dict)
+
     # 2. Compile dynamic LLM context prompt
     prompt = ""
     try:
@@ -221,7 +328,11 @@ async def receive_webhook_message(payload: dict = Body(...)):
     model_used = CONFIG["active_model"]
 
     try:
-        if model_used == "gemini" and gemini_client:
+        if routing_flags(row_series)['is_scam']:
+            action, message_type_pred, reason, confidence, evidence = apply_routing_policy(
+                ('digest', 'unknown', '', 0.75, 'none'), row_series)
+            model_used = 'policy'
+        elif model_used == "gemini" and gemini_client:
             action, message_type_pred, reason, confidence, evidence = (
                 process_message_with_gemini(
                     gemini_client, row_series, CONFIG["gemini_model"]
@@ -236,6 +347,9 @@ async def receive_webhook_message(payload: dict = Body(...)):
                 row_series
             )
             model_used = "heuristic"
+        action, message_type_pred, reason, confidence, evidence = validate_routing_result(
+            (action, message_type_pred, reason, confidence, evidence))
+        model_used = row_series.get('_model_used', model_used)
     except Exception as pipe_err:
         print(
             f"Error executing {model_used} pipeline: {pipe_err}. Falling back to heuristics."
@@ -245,25 +359,12 @@ async def receive_webhook_message(payload: dict = Body(...)):
         )
         model_used = "heuristic (fallback)"
 
-    # 4. Check Do Not Disturb settings (DND)
-    if CONFIG["dnd_enabled"]:
-        user_rows = users[users["user_id"] == user_id]
-        if len(user_rows) > 0:
-            dnd_window = user_rows.iloc[0]["do_not_disturb_window"]
-            from main import is_in_dnd
-
-            in_dnd = (
-                is_in_dnd(row_dict["created_at"], dnd_window) if dnd_window else False
-            )
-
-            # Direct mention check overrides DND
-            has_mention = False
-            if message_text and f"@{user_id}" in message_text:
-                has_mention = True
-
-            if action == "notify" and in_dnd and not has_mention:
-                action = "digest"
-                reason += " (Delivered to digest due to user Do Not Disturb hours)"
+    action, message_type_pred, reason, confidence, evidence = apply_routing_policy(
+        (action, message_type_pred, reason, confidence, evidence), row_series)
+    allowed_ids = {str(item['message_id']) for item in filtered_retrieved}
+    local_history = get_routing_local_history(row_series)
+    allowed_ids.update(local_history.loc[local_history['user_id'] == user_id, 'message_id'].astype(str))
+    evidence = ';'.join(identifier for identifier in evidence.split(';') if identifier in allowed_ids) or 'none'
 
     latency_ms = (time.time() - start_time) * 1000
 
@@ -287,22 +388,45 @@ async def receive_webhook_message(payload: dict = Body(...)):
         latency_ms=latency_ms,
         retrieved_rag=json.dumps(filtered_retrieved),
         prompt_compiled=prompt,
+        digest_delivered=0,
     )
-    db.add(log_entry)
-    db.commit()
-    db.refresh(log_entry)
-    db.close()
+    try:
+        db.add(log_entry)
+        db.flush()
+        response = {
+            "message_id": message_id,
+            "action": action,
+            "message_type": message_type_pred,
+            "reason": reason,
+            "confidence": confidence,
+            "evidence_message_ids": evidence,
+            "latency_ms": latency_ms,
+            "model_used": model_used,
+            "rag_matches": filtered_retrieved,
+            "timestamp": log_entry.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        response['duplicate'] = False
+        if receipt_key is not None:
+            db.get(GatewayReceipt, receipt_key).response = json.dumps(response)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
     # 5. Index new message text in ChromaDB for immediate memory updates
-    if message_text and message_text.strip() != "":
+    if not OFFLINE and message_text and message_text.strip() != "":
         try:
             chroma_client = get_chroma_client()
             collection = chroma_client.get_or_create_collection(name="message_history")
             collection.add(
-                ids=[message_id],
+                ids=[json.dumps([source, str(user_id), str(message_id)], separators=(',', ':'))],
                 documents=[message_text],
                 metadatas=[
                     {
+                        "source": source,
+                        "message_id": str(message_id),
                         "user_id": str(user_id),
                         "conversation_type": str(conversation_type),
                         "group_id": str(group_id or "none"),
@@ -315,17 +439,380 @@ async def receive_webhook_message(payload: dict = Body(...)):
         except Exception as add_err:
             print(f"Error indexing new message into ChromaDB: {add_err}")
 
+    return response
+
+
+@app.post("/api/gateway/webhook")
+async def receive_webhook_message(payload: dict = Body(...)):
+    return await route_incoming_message(payload)
+
+
+# ----------------- WHATSAPP CLOUD API & TWILIO WEBHOOKS -----------------
+
+
+async def send_whatsapp_message(recipient_phone: str, text: str) -> dict:
+    """Dispatches outbound text message to a WhatsApp user using Meta Cloud API."""
+    if OFFLINE:
+        return {'status': 'skipped', 'reason': 'Outbound delivery is disabled in offline mode'}
+    token = os.environ.get("WHATSAPP_TOKEN")
+    phone_id = os.environ.get("WHATSAPP_PHONE_NUMBER_ID")
+
+    if not token or not phone_id:
+        return {
+            "status": "skipped",
+            "reason": "WHATSAPP_TOKEN or WHATSAPP_PHONE_NUMBER_ID not configured",
+        }
+
+    url = f"https://graph.facebook.com/v20.0/{phone_id}/messages"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": recipient_phone,
+        "type": "text",
+        "text": {"body": text},
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, json=payload, headers=headers, timeout=10.0)
+            if not 200 <= resp.status_code < 300:
+                return {'status': 'error', 'detail': f'WhatsApp HTTP {resp.status_code}'}
+            data = resp.json()
+            if not isinstance(data, dict) or not data.get('messages') or not data['messages'][0].get('id'):
+                return {'status': 'error', 'detail': 'WhatsApp did not acknowledge a message'}
+            return {**data, 'status': 'dispatched'}
+    except Exception as err:
+        return {"status": "error", "detail": str(err)}
+
+
+@app.get("/api/webhook/whatsapp")
+async def verify_whatsapp_webhook(request: Request):
+    """Meta WhatsApp Webhook verification handshake."""
+    params = request.query_params
+    mode = params.get("hub.mode")
+    token = params.get("hub.verify_token")
+    challenge = params.get("hub.challenge")
+
+    verify_token = os.environ.get("WHATSAPP_VERIFY_TOKEN")
+    if not verify_token:
+        raise HTTPException(503, 'WHATSAPP_VERIFY_TOKEN is not configured')
+
+    if mode == "subscribe" and token and hmac.compare_digest(token.encode(), verify_token.encode()):
+        return Response(content=challenge or "", media_type="text/plain", status_code=200)
+    return Response(content="Verification failed", status_code=403)
+
+
+@app.post("/api/webhook/whatsapp")
+async def receive_whatsapp_message(request: Request):
+    """Handles incoming Meta WhatsApp events, parses messages, and routes through gateway."""
+    secret = os.environ.get('WHATSAPP_APP_SECRET')
+    if not secret:
+        raise HTTPException(503, 'WHATSAPP_APP_SECRET is not configured')
+    raw = await request.body()
+    expected = 'sha256=' + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(request.headers.get('x-hub-signature-256', '').encode(), expected.encode()):
+        raise HTTPException(403, 'Invalid Meta signature')
+    try:
+        body = json.loads(raw)
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON payload"})
+
+    if not isinstance(body, dict) or not isinstance(body.get('entry', []), list):
+        raise HTTPException(400, 'Invalid Meta event structure')
+    entries = body.get("entry", [])
+    routed_messages = []
+    errors = []
+
+    for entry in entries:
+        for change in entry.get("changes", []):
+            val = change.get("value", {})
+
+            # Status updates (sent, delivered, read) - acknowledge and skip
+            if "statuses" in val and "messages" not in val:
+                continue
+
+            messages = val.get("messages", [])
+            for msg in messages:
+                from_phone = msg.get("from", "unknown")
+                msg_id = msg.get("id", f"wa_{int(time.time() * 1000)}")
+                msg_type = msg.get("type", "text")
+
+                media_type = None
+                media_id = None
+                message_text = ""
+
+                if msg_type == "text":
+                    message_text = msg.get("text", {}).get("body", "")
+                elif msg_type == "image":
+                    message_text = msg.get("image", {}).get("caption", "[Image Attachment]")
+                    media_type = "image"
+                    media_id = msg.get("image", {}).get("id")
+                elif msg_type in ("audio", "voice"):
+                    message_text = "[Voice Note / Audio Attachment]"
+                    media_type = "audio"
+                    media_id = msg.get(msg_type, {}).get("id")
+                elif msg_type == "document":
+                    message_text = (
+                        msg.get("document", {}).get("caption")
+                        or msg.get("document", {}).get("filename", "[Document Attachment]")
+                    )
+                    media_type = "document"
+                    media_id = msg.get("document", {}).get("id")
+                elif msg_type == "interactive":
+                    interactive = msg.get("interactive", {})
+                    itype = interactive.get("type")
+                    if itype == "button_reply":
+                        message_text = interactive.get("button_reply", {}).get("title", "[Button Reply]")
+                    elif itype == "list_reply":
+                        message_text = interactive.get("list_reply", {}).get("title", "[List Reply]")
+                    else:
+                        message_text = "[Interactive Response]"
+                else:
+                    message_text = f"[{msg_type} message]"
+
+                router_payload = {
+                    "message_id": msg_id,
+                    "user_id": from_phone,
+                    "conversation_type": "business",
+                    "sender_user_id": from_phone,
+                    "group_id": "none",
+                    "business_id": "whatsapp_gateway",
+                    "message_text": message_text,
+                    "media_type": media_type,
+                    "media_id": media_id,
+                    "forwarded_count": 0,
+                }
+
+                try:
+                    result = await route_incoming_message(router_payload, source='meta')
+                    routed_messages.append(result)
+
+                    # Optional auto-reply when enabled
+                    if os.environ.get("WHATSAPP_AUTO_REPLY", "false").lower() == "true" and result["action"] == "notify" and not result["duplicate"]:
+                        reply_text = f"Gateway: [{result['action'].upper()}] - {result['reason']}"
+                        await send_whatsapp_message(from_phone, reply_text)
+                except Exception as route_err:
+                    errors.append({"message_id": msg_id, "error": "Routing failed; retry this event"})
+
+    response = {'status': 'partial_failure' if errors else 'success',
+                'processed_count': len(routed_messages), 'results': routed_messages}
+    if errors:
+        return JSONResponse(status_code=503, content={**response, 'errors': errors})
+    return response
+
+
+@app.post("/api/webhook/twilio-whatsapp")
+async def receive_twilio_whatsapp(request: Request):
+    """Handles incoming Twilio WhatsApp sandbox/production webhook."""
+    raw_body = (await request.body()).decode("utf-8")
+    parsed = parse_qs(raw_body, keep_blank_values=True)
+    token = os.environ.get('TWILIO_AUTH_TOKEN')
+    if not token:
+        raise HTTPException(503, 'TWILIO_AUTH_TOKEN is not configured')
+    url = os.environ.get('TWILIO_WEBHOOK_URL') or str(request.url)
+    signed = url + ''.join(key + value for key in sorted(parsed) for value in sorted(set(parsed[key])))
+    expected = base64.b64encode(hmac.new(token.encode(), signed.encode(), hashlib.sha1).digest()).decode()
+    if not hmac.compare_digest(request.headers.get('x-twilio-signature', '').encode(), expected.encode()):
+        raise HTTPException(403, 'Invalid Twilio signature')
+    from_number = parsed.get("From", [""])[0]
+    body = parsed.get("Body", [""])[0]
+    msg_id = parsed.get("MessageSid", [f"tw_{int(time.time() * 1000)}"])[0]
+    sender = from_number.replace("whatsapp:", "") if from_number else "unknown"
+
+    router_payload = {
+        "message_id": msg_id,
+        "user_id": sender,
+        "conversation_type": "business",
+        "sender_user_id": sender,
+        "group_id": "none",
+        "business_id": "twilio_whatsapp",
+        "message_text": body,
+        "media_type": None,
+        "media_id": None,
+        "forwarded_count": 0,
+    }
+
+    result = await route_incoming_message(router_payload, source='twilio')
+    return Response(content="<Response></Response>", media_type="application/xml")
+
+
+# ----------------- DIGEST SUMMARIZER & DELIVERY -----------------
+
+
+def generate_digest_summary_text(messages_data: list) -> str:
+    """Generates a 2-3 bullet point executive summary from a list of message dictionaries.
+
+    Uses Gemini or Groq if configured, otherwise falls back to a structured rule-based digest.
+    """
+    if not messages_data:
+        return "No pending messages in your digest."
+
+    bullet_items = []
+    for m in messages_data:
+        sender = (
+            m.get("sender_user_id")
+            or m.get("business_id")
+            or m.get("group_id")
+            or "Unknown"
+        )
+        text = (m.get("message_text") or "").strip()
+        bullet_items.append(f"- From [{sender}]: {text}")
+
+    messages_block = "\n".join(bullet_items)
+
+    prompt = (
+        "You are an intelligent notification assistant. The user has received the following "
+        "low-priority or quiet-hour notifications while away:\n\n"
+        f"{messages_block}\n\n"
+        "Provide a concise, 2-3 bullet point summary highlighting what happened. "
+        "Do not include preamble. Format strictly as short, readable bullet points."
+    )
+
+    # 1. Try Gemini
+    if gemini_client and CONFIG["active_model"] == "gemini":
+        try:
+            response = gemini_client.models.generate_content(
+                model=CONFIG.get("gemini_model", "gemini-2.5-flash"),
+                contents=prompt,
+            )
+            if response and response.text:
+                return response.text.strip()
+        except Exception as e:
+            print(f"Gemini digest generation failed: {e}")
+
+    if groq_key and CONFIG['active_model'] in {'gemini', 'groq'}:
+        try:
+            return groq_completion(prompt, model_name=CONFIG['groq_model'], json_mode=False)
+        except Exception as error:
+            print(f'Groq digest generation failed: {error}')
+
+    # 3. Rule-based structured fallback (Zero external dependencies)
+    total_count = len(messages_data)
+    senders = list(
+        set(
+            [
+                m.get("sender_user_id") or m.get("business_id") or "various senders"
+                for m in messages_data
+            ]
+        )
+    )
+    categories = list(
+        set([m.get("message_type_pred") or "general" for m in messages_data])
+    )
+
+    preview_lines = [f"• Received {total_count} updates from {', '.join(senders[:3])}."]
+    preview_lines.append(f"• Categories include: {', '.join(categories[:3])}.")
+    if len(messages_data) > 0:
+        first_preview = (messages_data[-1].get("message_text") or "")[:60]
+        preview_lines.append(f'• Latest: "{first_preview}..."')
+    return "\n".join(preview_lines)
+
+
+async def process_user_digest(user_id: str, auto_send: bool = False) -> dict:
+    """Preview without consuming; mark accepted only after successful dispatch."""
+    key = json.dumps(['digest', user_id])
+    if auto_send:
+        claim_receipt(key)
+    try:
+        with SessionLocal() as db:
+            pending = db.query(GatewayLog).filter(
+                GatewayLog.user_id == user_id, GatewayLog.action == 'digest',
+                GatewayLog.digest_delivered == 0).order_by(GatewayLog.id.asc()).all()
+            messages_data = [{
+                'id': log.id, 'message_id': log.message_id, 'sender_user_id': log.sender_user_id,
+                'business_id': log.business_id, 'group_id': log.group_id,
+                'message_text': log.message_text, 'message_type_pred': log.message_type_pred,
+            } for log in pending]
+        if not messages_data:
+            return {'status': 'empty', 'user_id': user_id, 'message_count': 0, 'summary': 'No pending digest items.'}
+        summary = generate_digest_summary_text(messages_data)
+        dispatch = 'skipped'
+        if auto_send:
+            try:
+                response = await send_whatsapp_message(user_id, f'Your Notification Digest:\n\n{summary}')
+                dispatch = response.get('status', 'error')
+            except Exception:
+                dispatch = 'error'
+            if dispatch == 'dispatched':
+                with SessionLocal.begin() as db:
+                    db.query(GatewayLog).filter(GatewayLog.id.in_([item['id'] for item in messages_data])).update(
+                        {'digest_delivered': 1}, synchronize_session=False)
+        return {'status': 'success' if not auto_send or dispatch == 'dispatched' else dispatch,
+                'user_id': user_id, 'message_count': len(messages_data), 'summary': summary,
+                'message_ids': [item['message_id'] for item in messages_data], 'dispatch': dispatch}
+    finally:
+        if auto_send:
+            release_receipt(key)
+
+
+@app.get("/api/digest/pending/{user_id}")
+async def get_pending_digest(user_id: str):
+    """Returns list of pending, un-dispatched digest messages for a user."""
+    db = SessionLocal()
+    pending = (
+        db.query(GatewayLog)
+        .filter(
+            GatewayLog.user_id == user_id,
+            GatewayLog.action == "digest",
+            GatewayLog.digest_delivered == 0,
+        )
+        .order_by(GatewayLog.id.asc())
+        .all()
+    )
+    db.close()
+
+    results = [
+        {
+            "id": l.id,
+            "message_id": l.message_id,
+            "sender": l.sender_user_id or l.business_id or l.group_id or "unknown",
+            "text": l.message_text,
+            "type": l.message_type_pred,
+            "reason": l.reason,
+            "timestamp": l.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            if l.timestamp
+            else "",
+        }
+        for l in pending
+    ]
+    return {"user_id": user_id, "pending_count": len(results), "messages": results}
+
+
+@app.post("/api/digest/generate/{user_id}")
+async def generate_user_digest(user_id: str, auto_send: bool = False):
+    """Preview a digest, or dispatch it and mark provider-accepted messages."""
+    result = await process_user_digest(user_id=user_id, auto_send=auto_send)
+    return result
+
+
+@app.post("/api/digest/dispatch-all")
+async def dispatch_all_pending_digests(auto_send: bool = False):
+    """Finds all distinct users with pending digest notifications and processes them in batch."""
+    db = SessionLocal()
+    user_rows = (
+        db.query(GatewayLog.user_id)
+        .filter(
+            GatewayLog.action == "digest",
+            GatewayLog.digest_delivered == 0,
+        )
+        .distinct()
+        .all()
+    )
+    db.close()
+
+    user_ids = [r[0] for r in user_rows if r[0]]
+    dispatched = []
+
+    for uid in user_ids:
+        res = await process_user_digest(user_id=uid, auto_send=auto_send)
+        dispatched.append(res)
+
     return {
-        "message_id": message_id,
-        "action": action,
-        "message_type": message_type_pred,
-        "reason": reason,
-        "confidence": confidence,
-        "evidence_message_ids": evidence,
-        "latency_ms": latency_ms,
-        "model_used": model_used,
-        "rag_matches": filtered_retrieved,
-        "timestamp": log_entry.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+        "status": "success" if all(item["status"] in {"success", "empty"} for item in dispatched) else "partial_failure",
+        "users_processed_count": len(dispatched),
+        "results": dispatched,
     }
 
 
@@ -363,6 +850,16 @@ async def get_gateway_logs(limit: int = 50):
 
 
 # ----------------- CLIENT SIMULATION API ENDPOINTS -----------------
+
+
+@app.exception_handler(DatasetError)
+async def dataset_error_handler(request: Request, error: DatasetError):
+    return JSONResponse(status_code=503, content={'code': 'dataset_invalid', 'detail': str(error)})
+
+
+@app.get('/api/dataset/status')
+async def get_dataset_status():
+    return inspect_dataset(DATA_DIR)
 
 
 @app.get("/api/users")
@@ -445,7 +942,8 @@ async def get_user_contacts(user_id: str):
 
 @app.get("/api/client/messages/{user_id}/{contact_id}")
 async def get_client_messages(user_id: str, contact_id: str):
-    user_hist = message_history[message_history["user_id"] == user_id]
+    history = get_message_history()
+    user_hist = history[history["user_id"] == user_id]
     context_hist = pd.DataFrame()
 
     is_group = (
@@ -471,7 +969,8 @@ async def get_client_messages(user_id: str, contact_id: str):
     msg_list = []
 
     # Event mapping
-    events_subset = message_events[message_events["user_id"] == user_id]
+    events = get_message_events()
+    events_subset = events[events["user_id"] == user_id]
     events_map = events_subset.set_index("message_id").to_dict(orient="index")
 
     if len(context_hist) > 0:

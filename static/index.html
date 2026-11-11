@@ -25,7 +25,7 @@
                     <span id="blocked-rate" class="stat-value">0%</span>
                 </div>
                 <div class="stat-card">
-                    <span class="stat-value text-success">● Online</span>
+                    <span class="stat-value text-success"><span id="gateway-status">Connect with an access token</span></span>
                 </div>
             </div>
         </header>
@@ -42,6 +42,11 @@
                     <!-- Config Settings -->
                     <div class="sandbox-section">
                         <h3>Gateway Configuration</h3>
+                        <div class="form-group">
+                            <label for="gateway-token">Gateway access token</label>
+                            <input id="gateway-token" type="password" autocomplete="off" placeholder="Required to connect">
+                            <button id="save-token-btn" class="btn btn-secondary">Connect</button>
+                        </div>
                         <div class="form-group">
                             <label for="config-model">Active Routing Engine</label>
                             <select id="config-model">
@@ -70,6 +75,7 @@
                     <!-- Webhook Simulator -->
                     <div class="sandbox-section">
                         <h3>Webhook Sandbox Payload</h3>
+                        <p id="dataset-status" class="panel-subtitle" role="status" aria-live="polite">Connect to check dataset setup.</p>
                         <div class="form-group">
                             <label for="payload-recipient">Target Recipient (User)</label>
                             <select id="payload-recipient">
@@ -77,7 +83,7 @@
                             </select>
                         </div>
                         <div class="form-group">
-                            <label for="incoming-queue">Incoming Queue (dataset/messages.csv)</label>
+                            <label for="incoming-queue">Incoming Queue (configured messages.csv)</label>
                             <select id="incoming-queue">
                                 <option value="">-- Choose message to load --</option>
                             </select>

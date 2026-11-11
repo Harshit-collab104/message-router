@@ -1,0 +1,16 @@
+.git
+.venv
+venv
+**/__pycache__
+.pytest_cache
+.env
+.env.*
+!.env.example
+*.db*
+*.sqlite*
+chroma_db
+
+# Seed explicitly in a mounted/configured data directory.
+dataset
+
+demo_runtime

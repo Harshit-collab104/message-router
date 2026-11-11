@@ -1,20 +1,34 @@
 import os
+import json
 import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
-import chromadb
+from dataset_store import DATA_DIR, CHROMA_DIR, OFFLINE, DatasetError, read_csv_table
 
 # Path settings
 WORKSPACE_DIR = Path(__file__).parent.parent
-MSG_ROUTER_DIR = WORKSPACE_DIR / "msg_router"
-CHROMA_DB_PATH = MSG_ROUTER_DIR / "chroma_db"
+MSG_ROUTER_DIR = Path(__file__).resolve().parent
+CHROMA_DB_PATH = CHROMA_DIR
 
 print(f"ChromaDB persistent path set to: {CHROMA_DB_PATH}")
 
 def get_client():
+    if OFFLINE:
+        raise DatasetError('Vector storage is disabled in offline mode')
+    import chromadb
     return chromadb.PersistentClient(path=str(CHROMA_DB_PATH))
 
 def init_db(history_csv_path, force_rebuild=False):
+    print(f"Loading history from {history_csv_path} for ChromaDB indexing...")
+    df = read_csv_table(history_csv_path, table_name='message_history.csv', required=True)
+    
+    # Load events to join reactions into metadata
+    events_csv_path = Path(history_csv_path).parent / "message_events.csv"
+    if events_csv_path.exists():
+        print(f"Loading events from {events_csv_path} to join with history...")
+        events_df = read_csv_table(events_csv_path, required=True)
+        df = df.merge(events_df, on=["message_id", "user_id"], how="left")
+    
     client = get_client()
     
     # Get or create collection
@@ -34,33 +48,24 @@ def init_db(history_csv_path, force_rebuild=False):
         print(f"ChromaDB collection '{collection_name}' already contains {existing_count} documents. Skipping indexing.")
         return collection
         
-    print(f"Loading history from {history_csv_path} for ChromaDB indexing...")
-    df = pd.read_csv(history_csv_path)
-    
-    # Load events to join reactions into metadata
-    events_csv_path = Path(history_csv_path).parent / "message_events.csv"
-    if events_csv_path.exists():
-        print(f"Loading events from {events_csv_path} to join with history...")
-        events_df = pd.read_csv(events_csv_path)
-        df = df.merge(events_df, on=["message_id", "user_id"], how="left")
-    
     # Fill NA values for string columns to avoid errors
     df['message_text'] = df['message_text'].fillna("")
     df['group_id'] = df['group_id'].fillna("none")
     df['business_id'] = df['business_id'].fillna("none")
     df['sender_user_id'] = df['sender_user_id'].fillna("none")
     df['media_type'] = df['media_type'].fillna("none")
+    df['source'] = df['source'].fillna('history') if 'source' in df else 'history'
     
     # We only index documents with non-empty text and ensure unique IDs
     df_to_index = df[df['message_text'] != ""]
-    df_to_index = df_to_index.drop_duplicates(subset=['message_id'])
+    df_to_index = df_to_index.drop_duplicates(subset=['source', 'user_id', 'message_id'])
     
     ids = []
     documents = []
     metadatas = []
     
     for idx, row in df_to_index.iterrows():
-        ids.append(str(row['message_id']))
+        ids.append(json.dumps([str(row.get('source', 'history')), str(row['user_id']), str(row['message_id'])], separators=(',', ':')))
         documents.append(row['message_text'])
         
         # Read reaction values
@@ -71,6 +76,8 @@ def init_db(history_csv_path, force_rebuild=False):
         reported = int(row.get('message_reported', 0)) if pd.notna(row.get('message_reported')) else 0
 
         metadatas.append({
+            'source': str(row.get('source', 'history')),
+            'message_id': str(row['message_id']),
             'user_id': str(row['user_id']),
             'conversation_type': str(row['conversation_type']),
             'group_id': str(row['group_id']),
@@ -104,7 +111,7 @@ def retrieve_relevant_history(user_id, conv_type, group_id, business_id, sender_
     Query ChromaDB for relevant history messages under the specific conversation context.
     Uses Cascading Fallback Retrieval if no matching context is found.
     """
-    if not message_text or pd.isna(message_text):
+    if OFFLINE or not message_text or pd.isna(message_text):
         return []
         
     client = get_client()
@@ -135,12 +142,7 @@ def retrieve_relevant_history(user_id, conv_type, group_id, business_id, sender_
     if len(filters) > 1:
         where_filters_to_try.append({"where": {"user_id": str(user_id)}, "label": "user fallback"})
         
-    # Cascade 3: Channel-only match (fallback to general messages involving this sender/group)
-    if context_filter:
-        where_filters_to_try.append({"where": context_filter, "label": "channel fallback"})
-        
-    # Cascade 4: Global match (no filter at all, find semantically closest message in dataset)
-    where_filters_to_try.append({"where": None, "label": "global search"})
+    # Private history never falls back outside the recipient's ownership scope.
 
     for attempt in where_filters_to_try:
         try:
@@ -158,6 +160,9 @@ def retrieve_relevant_history(user_id, conv_type, group_id, business_id, sender_
                     distance = results['distances'][0][idx] if 'distances' in results else 0.0
                     metadata = results['metadatas'][0][idx]
                     
+                    if not metadata or str(metadata.get('user_id')) != str(user_id):
+                        continue
+                    doc_id = metadata.get('message_id', doc_id)
                     # Store lookup fallback label in metadata for auditing
                     metadata_copy = dict(metadata) if metadata else {}
                     metadata_copy["retrieval_strategy"] = attempt["label"]
@@ -195,9 +200,13 @@ def test_retrieval():
     return len(res) >= 0
 
 if __name__ == "__main__":
-    large_history_csv = MSG_ROUTER_DIR / "dataset" / "message_history.csv"
-    if large_history_csv.exists():
-        init_db(large_history_csv)
+    import sys
+    history_csv = DATA_DIR / 'message_history.csv'
+    try:
+        if not history_csv.exists():
+            raise DatasetError(f'Missing required CSV: {history_csv}')
+        init_db(history_csv)
         test_retrieval()
-    else:
-        print(f"Error: large history file not found at {large_history_csv}")
+    except (DatasetError, OSError) as error:
+        print(f'Message Router vector store: {error}', file=sys.stderr)
+        raise SystemExit(2)

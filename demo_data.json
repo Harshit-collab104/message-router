@@ -1,0 +1,237 @@
+{
+  "schema_version": 1,
+  "description": "Original synthetic examples; no real messages, identities or downloaded corpus. Fixed timestamps intentionally make routing reproducible.",
+  "tables": {
+    "users.csv": [
+      {
+        "user_id": "u_001",
+        "user_name": "Demo Recipient",
+        "do_not_disturb_window": "",
+        "messages_opened_30d": 3,
+        "messages_replied_30d": 1,
+        "notifications_dismissed_30d": 0,
+        "messages_reported_30d": 0
+      },
+      {
+        "user_id": "u_002",
+        "user_name": "Demo Colleague",
+        "do_not_disturb_window": "",
+        "messages_opened_30d": 3,
+        "messages_replied_30d": 1,
+        "notifications_dismissed_30d": 0,
+        "messages_reported_30d": 0
+      }
+    ],
+    "groups.csv": [
+      {
+        "group_id": "group_demo",
+        "group_name": "Demo Friends",
+        "group_type": "friends"
+      }
+    ],
+    "group_members.csv": [
+      {
+        "group_id": "group_demo",
+        "user_id": "u_001",
+        "role": "member",
+        "group_muted_by_user": 1
+      },
+      {
+        "group_id": "group_demo",
+        "user_id": "u_002",
+        "role": "admin",
+        "group_muted_by_user": 0
+      }
+    ],
+    "business_accounts.csv": [
+      {
+        "business_id": "biz_delivery",
+        "business_name": "Demo Delivery",
+        "category": "logistics",
+        "verified": 1
+      },
+      {
+        "business_id": "biz_shop",
+        "business_name": "Demo Shop",
+        "category": "fashion",
+        "verified": 1
+      }
+    ],
+    "user_business_history.csv": [
+      {
+        "user_id": "u_001",
+        "business_id": "biz_delivery",
+        "allows_promotions": 1
+      },
+      {
+        "user_id": "u_001",
+        "business_id": "biz_shop",
+        "allows_promotions": 0
+      }
+    ],
+    "messages.csv": [
+      {
+        "user_id": "u_001",
+        "conversation_type": "personal",
+        "group_id": "",
+        "business_id": "",
+        "sender_user_id": "u_002",
+        "media_type": "",
+        "media_id": "",
+        "forwarded_count": 0,
+        "message_id": "demo_personal",
+        "created_at": "2026-01-02 12:00:00",
+        "message_text": "Can you review the deployment plan today?"
+      },
+      {
+        "user_id": "u_001",
+        "conversation_type": "business",
+        "group_id": "",
+        "business_id": "biz_delivery",
+        "sender_user_id": "",
+        "media_type": "",
+        "media_id": "",
+        "forwarded_count": 0,
+        "message_id": "demo_delivery",
+        "created_at": "2026-01-02 12:00:00",
+        "message_text": "Your order has shipped."
+      },
+      {
+        "user_id": "u_001",
+        "conversation_type": "personal",
+        "group_id": "",
+        "business_id": "",
+        "sender_user_id": "u_002",
+        "media_type": "",
+        "media_id": "",
+        "forwarded_count": 0,
+        "message_id": "demo_scam",
+        "created_at": "2026-01-02 12:00:00",
+        "message_text": "Pay a processing fee to unlock the prize."
+      },
+      {
+        "user_id": "u_001",
+        "conversation_type": "group",
+        "group_id": "group_demo",
+        "business_id": "",
+        "sender_user_id": "u_002",
+        "media_type": "",
+        "media_id": "",
+        "forwarded_count": 0,
+        "message_id": "demo_mention",
+        "created_at": "2026-01-02 12:00:00",
+        "message_text": "Hello @u_001 please review the notes."
+      },
+      {
+        "user_id": "u_001",
+        "conversation_type": "business",
+        "group_id": "",
+        "business_id": "biz_shop",
+        "sender_user_id": "",
+        "media_type": "",
+        "media_id": "",
+        "forwarded_count": 0,
+        "message_id": "demo_promotion",
+        "created_at": "2026-01-02 12:00:00",
+        "message_text": "Sale: get a discount today."
+      }
+    ],
+    "message_history.csv": [
+      {
+        "user_id": "u_001",
+        "conversation_type": "personal",
+        "group_id": "",
+        "business_id": "",
+        "sender_user_id": "u_002",
+        "media_type": "",
+        "media_id": "",
+        "forwarded_count": 0,
+        "message_id": "demo_history_personal",
+        "created_at": "2026-01-01 12:00:00",
+        "message_text": "Can you review the deployment plan?"
+      },
+      {
+        "user_id": "u_001",
+        "conversation_type": "business",
+        "group_id": "",
+        "business_id": "biz_delivery",
+        "sender_user_id": "",
+        "media_type": "",
+        "media_id": "",
+        "forwarded_count": 0,
+        "message_id": "demo_history_delivery",
+        "created_at": "2026-01-01 12:00:00",
+        "message_text": "Your order has shipped."
+      },
+      {
+        "user_id": "u_001",
+        "conversation_type": "group",
+        "group_id": "group_demo",
+        "business_id": "",
+        "sender_user_id": "u_002",
+        "media_type": "",
+        "media_id": "",
+        "forwarded_count": 0,
+        "message_id": "demo_history_group",
+        "created_at": "2026-01-01 12:00:00",
+        "message_text": "Notes for the next catch-up."
+      }
+    ],
+    "message_events.csv": [
+      {
+        "message_id": "demo_history_personal",
+        "user_id": "u_001",
+        "message_opened": 1,
+        "message_replied": 1,
+        "notification_dismissed": 0,
+        "muted_after_message": 0,
+        "message_reported": 0
+      },
+      {
+        "message_id": "demo_history_delivery",
+        "user_id": "u_001",
+        "message_opened": 1,
+        "message_replied": 0,
+        "notification_dismissed": 0,
+        "muted_after_message": 0,
+        "message_reported": 0
+      },
+      {
+        "message_id": "demo_history_group",
+        "user_id": "u_001",
+        "message_opened": 1,
+        "message_replied": 0,
+        "notification_dismissed": 0,
+        "muted_after_message": 0,
+        "message_reported": 0
+      }
+    ],
+    "ground_truth.csv": [
+      {
+        "message_id": "demo_personal",
+        "action": "notify",
+        "message_type": "personal"
+      },
+      {
+        "message_id": "demo_delivery",
+        "action": "digest",
+        "message_type": "business_update"
+      },
+      {
+        "message_id": "demo_scam",
+        "action": "mute",
+        "message_type": "scam"
+      },
+      {
+        "message_id": "demo_mention",
+        "action": "notify",
+        "message_type": "personal"
+      },
+      {
+        "message_id": "demo_promotion",
+        "action": "mute",
+        "message_type": "promotion"
+      }
+    ]
+  }
+}

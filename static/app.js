@@ -48,13 +48,58 @@ const tabQuarantineBadge = document.getElementById("badge-quarantine");
 const modal = document.getElementById("inspector-modal");
 const closeModalBtn = document.getElementById("close-modal");
 
+async function apiFetch(url, options = {}) {
+    const headers = new Headers(options.headers || {});
+    const token = sessionStorage.getItem('gatewayToken');
+    if (token) headers.set('Authorization', `Bearer ${token}`);
+    const response = await fetch(url, {...options, headers});
+    const status = document.getElementById('gateway-status');
+    if (status) status.textContent = response.ok ? 'Connected' : `Gateway HTTP ${response.status}`;
+    return response;
+}
+
+function renderDatasetStatus(info) {
+    const target = document.getElementById('dataset-status');
+    if (!target) return;
+    if (info.ready) {
+        target.textContent = `Dataset ready${info.offline_mode ? ' (offline mode)' : ''}. Restart the gateway after changing input files.`;
+    } else if ((info.errors || []).length > 0) {
+        target.textContent = `Dataset invalid: ${info.errors.join('; ')}. Run python dataset_store.py validate.`;
+    } else {
+        const missing = (info.missing || []).join(', ');
+        target.textContent = `Dataset incomplete (${missing}). For a new empty data directory, run python dataset_store.py bootstrap, then restart the gateway. Existing data is never overwritten.`;
+    }
+}
+
+async function fetchDatasetStatus() {
+    const target = document.getElementById('dataset-status');
+    try {
+        const response = await apiFetch('/api/dataset/status');
+        if (response.ok) renderDatasetStatus(await response.json());
+        else if (target) target.textContent = 'Connect with a valid gateway token to check dataset setup.';
+    } catch (error) {
+        if (target) target.textContent = 'Dataset status unavailable. Check the gateway connection.';
+    }
+}
+
 // ----------------- INITIALIZATION -----------------
 
 document.addEventListener("DOMContentLoaded", async () => {
+    document.getElementById('gateway-token').value = sessionStorage.getItem('gatewayToken') || '';
+    document.getElementById('save-token-btn').addEventListener('click', async () => {
+        const token = document.getElementById('gateway-token').value.trim();
+        if (token) sessionStorage.setItem('gatewayToken', token);
+        else sessionStorage.removeItem('gatewayToken');
+        await fetchConfig();
+        await fetchDatasetStatus();
+        await fetchUsers();
+        await fetchLogs();
+    });
     updateClock();
     setInterval(updateClock, 60000);
     
     await fetchConfig();
+    await fetchDatasetStatus();
     await fetchUsers();
     await fetchLogs();
     
@@ -74,7 +119,7 @@ function updateClock() {
 
 async function fetchConfig() {
     try {
-        const response = await fetch("/api/gateway/config");
+        const response = await apiFetch("/api/gateway/config");
         if (response.ok) {
             const config = await response.json();
             configModel.value = config.active_model;
@@ -94,7 +139,7 @@ async function updateConfig() {
         dnd_enabled: configDnd.checked
     };
     try {
-        const response = await fetch("/api/gateway/config", {
+        const response = await apiFetch("/api/gateway/config", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload)
@@ -113,7 +158,7 @@ async function updateConfig() {
 
 async function fetchUsers() {
     try {
-        const response = await fetch("/api/users");
+        const response = await apiFetch("/api/users");
         if (response.ok) {
             users = await response.json();
             populateRecipientOptions();
@@ -143,7 +188,7 @@ async function selectRecipient(userId) {
 
 async function fetchIncomingQueue(userId) {
     try {
-        const response = await fetch(`/api/incoming/${userId}`);
+        const response = await apiFetch(`/api/incoming/${userId}`);
         if (response.ok) {
             incomingQueue = await response.json();
             populateIncomingQueue();
@@ -166,7 +211,7 @@ function populateIncomingQueue() {
 
 async function fetchContacts(userId) {
     try {
-        const response = await fetch(`/api/contacts/${userId}`);
+        const response = await apiFetch(`/api/contacts/${userId}`);
         if (response.ok) {
             contacts = await response.json();
             populateSandboxDropdowns();
@@ -178,7 +223,7 @@ async function fetchContacts(userId) {
 
 async function fetchDeviceMessages(userId) {
     try {
-        const response = await fetch(`/api/client/device/${userId}`);
+        const response = await apiFetch(`/api/client/device/${userId}`);
         if (response.ok) {
             mockDeviceData = await response.json();
             renderDeviceMessages();
@@ -190,7 +235,7 @@ async function fetchDeviceMessages(userId) {
 
 async function fetchLogs() {
     try {
-        const response = await fetch("/api/gateway/logs");
+        const response = await apiFetch("/api/gateway/logs");
         if (response.ok) {
             logs = await response.json();
             renderLogs();
@@ -281,15 +326,15 @@ function renderLogs() {
                     <span class="timestamp">${timestamp}</span>
                     <span class="latency ${getLatencyClass(log.latency_ms)}">${log.latency_ms.toFixed(1)} ms</span>
                 </div>
-                <span class="log-action-badge ${log.action}">${log.action}</span>
+                <span class="log-action-badge ${escapeHTML(log.action)}">${escapeHTML(log.action)}</span>
             </div>
             <div class="log-body">
-                <strong>${log.conversation_type.toUpperCase()} / ${getSenderLabel(log)}:</strong> 
+                <strong>${escapeHTML(log.conversation_type.toUpperCase())} / ${escapeHTML(getSenderLabel(log))}:</strong> 
                 ${escapeHTML(log.message_text || "[Media Message]")}
             </div>
             <div class="log-footer">
                 <span class="log-reason">${escapeHTML(log.reason)}</span>
-                <span class="log-model">${log.message_type_pred.toUpperCase()}</span>
+                <span class="log-model">${escapeHTML(log.message_type_pred.toUpperCase())}</span>
             </div>
         `;
         logsFeed.appendChild(logCard);
@@ -410,7 +455,7 @@ async function sendWebhookPayload() {
     sendBtn.textContent = "POSTING Payloads...";
     
     try {
-        const response = await fetch("/api/gateway/webhook", {
+        const response = await apiFetch("/api/gateway/webhook", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload)
@@ -446,7 +491,7 @@ async function sendWebhookPayload() {
 
 function showInspector(log) {
     document.getElementById("inspect-action").textContent = log.action;
-    document.getElementById("inspect-action").className = `val badge ${log.action}`;
+    document.getElementById("inspect-action").className = `val badge ${escapeHTML(log.action)}`;
     document.getElementById("inspect-type").textContent = log.message_type_pred.toUpperCase();
     document.getElementById("inspect-confidence").textContent = log.confidence.toFixed(2);
     document.getElementById("inspect-latency").textContent = `${log.latency_ms.toFixed(1)} ms`;
@@ -488,7 +533,7 @@ function showInspector(log) {
                 <div class="rag-match-header">
                     <span>MATCH #${idx + 1}</span>
                     <div class="rag-match-meta">
-                        <span>${metaStr}</span>
+                        <span>${escapeHTML(metaStr)}</span>
                         <span class="rag-match-distance">L2: ${m.distance.toFixed(3)}</span>
                     </div>
                 </div>

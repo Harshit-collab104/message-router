@@ -16,12 +16,30 @@ msg_router/chroma_db/
 chroma_db/
 *.db
 *.sqlite
+*.sqlite3
+*.db-*
+*.sqlite-*
+*.sqlite3-*
 msg_router_gateway.db
 
 # Secrets & Environment variables
 .env
 .env.*
+!.env.example
 
 # OS files
 .DS_Store
 Thumbs.db
+
+# Generated or user-provided CSV data; the synthetic demo source is demo_data.json.
+/dataset/
+
+# Isolated local demo runtime from DATASET_WORKFLOW.md.
+/demo_runtime/
+
+# Local submission and verification artifacts
+/submission/
+/code.zip
+/output.csv
+/log.txt
+/*-results.xml
